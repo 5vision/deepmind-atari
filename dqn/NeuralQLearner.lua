@@ -151,6 +151,18 @@ function nql:__init(args)
     if self.target_q then
         self.target_network = self.network:clone()
     end
+
+    self.need_pretrain = true
+    if self.need_pretrain then
+        self.im_size = 84
+        self.sp_size = 8
+        self.tp_size = 4
+        self.fl_units = 32
+        self.num_frames = 0
+        self.num_patches = 0
+        self.frames = torch.Tensor(2000, self.im_size, self.im_size)
+        self.patches = torch.Tensor(30000, self.tp_size*self.sp_size*self.sp_size)
+    end
 end
 
 
@@ -297,10 +309,155 @@ function nql:compute_validation_statistics()
 end
 
 
+function pcaeig(x, num_components)
+    
+    local c = (x * x:t()) / x:size(1)
+
+    local e,v = torch.symeig(c, 'V')
+
+    local t,i = torch.sort(-e)
+
+    e = e:index(1,i)
+    v = v:index(2,i)
+
+    local indices = torch.linspace(1,e:size(1),e:size(1)):long()
+    local i = indices[torch.gt(e, 0)]
+
+    e = e:index(1,i)
+    v = v:index(2,i)
+
+    v = torch.diag(e:pow(-0.5)) * v:t()
+
+    return v[{{1,num_components},{}}]
+end
+
+
+function sqrtmi(w)
+    -- find eigenvectors
+    local e,v = torch.eig(w, 'V')
+    e = e[{{},1}]
+    -- eliminate eigenvectors whose eigenvalues are zero
+    local indices = torch.linspace(1,e:size(1),e:size(1)):long()
+    local i = indices[torch.gt(e, 0)]
+
+    e = e:index(1,i)
+    v = v:index(2,i)
+
+    -- inverse square root
+    return v * torch.diag(e:pow(-0.5)) * v:t()
+end
+
+
 function nql:perceive(reward, rawstate, terminal, testing, testing_ep)
     -- Preprocess state (will be set to nil if terminal)
     local state = self:preprocess(rawstate):float()
     local curState
+
+    if self.need_pretrain then
+        if self.numSteps == self.learn_start then
+            if self.num_patches < 500 then
+                print('Patches '..self.num_patches)
+            else
+                self.patches = self.patches[{{1,self.num_patches},{}}]:t()
+
+                local X = self.patches - torch.mean(self.patches,2):expandAs(self.patches)
+                print('Patches '..X:size(1)..'x'..X:size(2))
+
+                local V = pcaeig(X, self.fl_units)
+                print('Components '..V:size(1)..'x'..V:size(2))
+
+                local H = torch.eye(self.fl_units, self.fl_units)
+
+                local ISA = function(W)
+                   local Z = V * X
+                   local P = H * torch.pow(W * Z, 2)
+
+                   P:add(0.0001)
+
+                   local J = torch.sum(torch.sqrt(P))
+
+                   local F = H:t() * torch.pow(P, -0.5)
+                   local dJ = torch.cmul((W * Z), F) * Z:t() / X:size(2)
+                   return J, dJ
+                end
+
+                local W = torch.rand(self.fl_units, self.fl_units)
+
+                require 'optim'
+
+                local isastate = {
+                   learningRate = 0.5,
+                   momentum = 0.7
+                }
+
+                for i = 1,1000 do
+                    W, j = optim.sgd(ISA, W, isastate)
+                    W = sqrtmi(W * W:t()) * W
+                    if i % 100 == 0 then
+                        print(string.format('J(%d) = %.5f', i, j[1]))
+                        collectgarbage()
+                    end
+                end
+
+                W = W * V
+
+                torch.save('pretrained.t7', {patches=patches, W=W})
+
+                W = W:reshape(self.fl_units, self.tp_size, self.sp_size, self.sp_size)
+                print('Pre-initialized weights:')
+                print('Min value '..W:min())
+                print('Max value '..W:max())
+                print('Mean value '..W:mean())
+
+                local weights_network = self.network:get(2).weight
+                print('Current network weights:')
+                print('Min value '..weights_network:min())
+                print('Max value '..weights_network:max())
+                print('Mean value '..weights_network:mean())
+
+                if self.gpu >= 0 then
+                    W = W:cuda()
+                end
+
+                self.network:get(2).weight = W
+                self.network:get(2).bias:zero()
+
+                if self.target_q then
+                    self.target_network:get(2).weight = W:clone()
+                    self.target_network:get(2).bias:zero()
+                end
+            end
+            self.need_pretrain = false
+
+        elseif terminal then
+            if self.num_frames > 100 and self.num_patches < 29800 then
+                local num_patches_in_episode = 0
+                for si = 1,200 do
+                    local x_pos = torch.random(1,self.im_size-self.sp_size+1)
+                    local y_pos = torch.random(1,self.im_size-self.sp_size+1)
+                    local t_pos = torch.random(1,self.num_frames-self.tp_size+1)
+                    local patch = self.frames[{{t_pos,t_pos+self.tp_size-1},
+                                            {x_pos,x_pos+self.sp_size-1},
+                                            {y_pos,y_pos+self.sp_size-1}}]
+                    for pj = 1,self.tp_size-1 do
+                        if torch.eq(patch[{pj,{{}}}], patch[{pj+1,{{}}}]):min() == 0 then
+                            num_patches_in_episode = num_patches_in_episode + 1
+                            self.num_patches = self.num_patches + 1
+                            self.patches[{self.num_patches,{}}] = patch:reshape(self.tp_size*self.sp_size*self.sp_size)
+                            break
+                        end
+                    end
+                end
+                print('Frames '..self.num_frames..', patches '..num_patches_in_episode)
+                collectgarbage()
+                self.num_frames = 0
+            end
+
+        elseif self.num_frames < 2000 then
+            self.num_frames = self.num_frames + 1
+            self.frames[{self.num_frames,{{}}}] = state
+        end
+    end
 
     if self.max_reward then
         reward = math.min(reward, self.max_reward)
