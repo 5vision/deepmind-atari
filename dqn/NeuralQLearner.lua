@@ -311,7 +311,7 @@ end
 
 function pcaeig(x, num_components)
     
-    local c = (x * x:t()) / x:size(1)
+    local c = (x * x:t()) / x:size(2)
 
     local e,v = torch.symeig(c, 'V')
 
@@ -348,6 +348,21 @@ function sqrtmi(w)
 end
 
 
+function poolmx(subspacesize, num_filters)
+    if subspacesize == 1 or num_filters % subspacesize ~= 0 then
+        return torch.eye(num_filters, num_filters)
+    end
+    local num_poolunits = num_filters / subspacesize
+    local H = torch.zeros(num_poolunits, num_filters)
+    for i = 1, num_poolunits do
+        for j = 1, subspacesize do
+            H[{{i},{(i-1)*subspacesize+j}}] = 1
+        end
+    end
+    return H
+end
+
+
 function nql:perceive(reward, rawstate, terminal, testing, testing_ep)
     -- Preprocess state (will be set to nil if terminal)
     local state = self:preprocess(rawstate):float()
@@ -366,7 +381,7 @@ function nql:perceive(reward, rawstate, terminal, testing, testing_ep)
                 local V = pcaeig(X, self.fl_units)
                 print('Components '..V:size(1)..'x'..V:size(2))
 
-                local H = torch.eye(self.fl_units, self.fl_units)
+                local H = poolmx(1, self.fl_units)
 
                 local ISA = function(W)
                    local Z = V * X
@@ -450,8 +465,8 @@ function nql:perceive(reward, rawstate, terminal, testing, testing_ep)
                 end
                 print('Frames '..self.num_frames..', patches '..num_patches_in_episode)
                 collectgarbage()
-                self.num_frames = 0
             end
+            self.num_frames = 0
 
         elseif self.num_frames < 2000 then
             self.num_frames = self.num_frames + 1
